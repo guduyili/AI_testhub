@@ -171,6 +171,7 @@ class BrowserAgent:
 
         # 3/4/5 初始化任务拆解器和浏览器配置
         self.task_analyzer = TaskAnalyzer()
+        self.browser_profile = create_browser_profile()
 
 
     def _load_model_config(self) -> Optional[AIModelConfig]:
@@ -187,4 +188,11 @@ class BrowserAgent:
     def verify_execution_result():
         return 
 
+    def create_browser_profile():
+        """创建 browser-use 浏览器配置。
+
+        学习版固定按 Linux/WSL 环境生成配置；真实项目可根据部署环境传入不同 system 和
+        chrome_path。
+        """
+        return create_browser_profile(system="Linux", chrome_path=None)
 
