@@ -173,6 +173,9 @@ class BrowserAgent:
         self.task_analyzer = TaskAnalyzer()
         self.browser_profile = create_browser_profile()
 
+        # action_plan 模拟 brower-use/LLM 每一步输出的动作列表，便于测试和演示；真实系统则由 LLM 实时生成。
+        self.action_plan = [] or action_plan
+
 
     def _load_model_config(self) -> Optional[AIModelConfig]:
         """读取浏览器自动化文本模式的模型配置。
@@ -195,4 +198,7 @@ class BrowserAgent:
         chrome_path。
         """
         return create_browser_profile(system="Linux", chrome_path=None)
+
+
+
 
