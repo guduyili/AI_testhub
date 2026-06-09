@@ -144,6 +144,8 @@ class  TaskAnalyzer:
         """
         if not steps:
             return []
+
+        # 合并相关连续步骤的中间结果
         compacted: List[str] = []
         i = 0
 
@@ -153,6 +155,65 @@ class  TaskAnalyzer:
 
             # 浏览器 + URL 相关连续步骤，合并为一个访问动作。
             if ("浏览器" in current or "browser" in lower or "地址栏" in current) and i + 1 < len(steps):
+                # 如果当前步骤提到浏览器/地址栏，且下一步骤看起来像 URL 输入或回车，则合并。
                 window = " ".join(str(s).strip() for s in steps[i:i+3])
-                
+                url_match = re.search(r"https?://[^\s]+", window)
+                if url_match:
+                    compacted.append(f"访问{url_match.group(0)}")
+                    i += min(3, len(steps) - i)  # 跳过合并的步骤
+                    continue
 
+            # 搜索框/关键词/搜索按钮相关连续步骤，合并为一个搜索意图
+            search_window = " ".join(str(s).strip() for s in steps[i:i+4])
+            if any(keyword in search_window for keyword in ["搜索框", "关键词", "百度一下", "搜索结果", "search"]):
+                query_match = re.search(r"(?:输入搜索关键词[:：]?\s*|搜索)\s*['\"]?([^'\"\n]+?)['\"]?(?:\s|$)", search_window)
+                if query_match:
+                    query = query_match.group(1).strip()
+                    compacted.append(f"搜索{query}")
+                    i += min(4, len(steps) - i)
+                    continue
+            
+            # 标签页关闭动作保持为清晰的单步
+            if any(keyword in current for keyword in ["关闭", "标签页", "新标签页", "close tab"]):
+                compacted.append("关闭该标签页")
+                i += 1
+                continue
+
+            compacted.append(current)
+            i += 1
+
+            # 去掉相邻重复步骤，避免前端展示和执行计划重复
+            deduped: List[str] = []
+            for step in compacted:
+                # 只有当当前步骤与上一个步骤不同时才添加，去掉相邻重复
+                if not deduped or deduped[-1] != step:
+                    deduped.append(step)
+            return deduped
+
+    def model_break_down_task(self, task_description: str) -> List[str]:
+        """调用可注入 LLM 拆分器；没有 LLM 时使用离线规则拆分。"""
+        if self.llm_breakdown:
+            return self.llm_breakdown(task_description)
+        # 离线回退：按中文/英文顺序连接词拆分。
+        parts = re.split(r"(?:，然后|然后|之后|再|；|;)", task_description)
+        return [p.strip(" ，。") for p in parts if p.strip(" ，。")]
+    
+    def finalize_steps(self, steps: Any, fallback_text: str) -> List[str]:
+        """统一执行 normalize + compact 两个后处理阶段。"""
+        return self.compact_steps(self.normalize_steps(steps, fallback_text))
+    
+
+    def analyze_task(self, task_description: str) -> List[str]:
+        """把自然语言任务拆成 planned_tasks。
+
+        Returns:
+            List[dict]: 每个元素包含 id、description、status。初始 status 固定为 pending，
+            后续由 BrowserAgent 的状态同步逻辑更新。
+        """
+        explicit_steps = self.extract_structured_steps(task_description)
+        if len(explicit_steps) >=2:
+            cleaned = self.normalize_steps(explicit_steps, task_description)
+        else:
+            cleaned = self.finalize_steps(self.model_break_down_task(task_description), task_description)
+
+        return [{"id": i + 1, "description": step, "status": "pending"} for i, step in enumerate(cleaned)]
