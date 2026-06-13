@@ -106,7 +106,128 @@ def enforce_single_task_step(actions: List[Dict[str, Any]]) -> List[Dict[str, An
         trimmed.append(action)
         if isinstance(action, dict):
             for name, params in action.items():
-                if isinstance(action, str):
+                if is_terminal_task_action(name, params):
+                    terminal_seen = True
+                    break
+
+    return trimmed
+
+
+def get_task_status_action_task_id(action: Dict[str, Any]) -> Optional[int]: 
+    """ 从任务状态动作种提取 task_id; 不是任务状态动作则返回 None"""
+    if not isinstance(action, dict):
+        return None
+    for name, params in action.items():
+        if name in TASK_STATUS_ACTIONS and isinstance(params, dict):
+            return params.get("task_id")
+        if name == "update_task_status" and isinstance(params, dict):
+            if str(params.get("status", "")).strip().lower() in TERMINAL_STATUSES:
+                return params.get("task_id")
+    return None
+
+def has_real_business_action(action: Dict[str, Any]) -> bool:
+    """判断 action 是否是真正会操作浏览器/页面的业务动作。"""
+    if not isinstance(action, dict):
+        return False
+    # 只要动作里有一个子动作不是任务状态相关的，就认为它包含真实业务动作。
+    return any(name not in TASK_STATUS_ACTIONS | {"update_task_status", "done"} for name in action.keys())
+
+
+
+def extract_task_literals(task_description: str) -> List[str]:
+    """提取任务描述中的关键字面量，用于判断业务动作是否仍属于当前待结算任务。
+
+    例如任务描述里有 URL、中文书名号、单双引号内容，这些通常会出现在真实 action
+    参数里。若模型在同一步中先标记任务完成，又继续输入同一个 URL/关键词，则可认为
+    该业务动作仍是当前任务的一部分，不必强行截断。
+    """
+    if not task_description:
+        return []
+    
+    text = str(task_description)
+    # 提取 URL
+    literals : List[str] = []
+    literals.extend(re.findall(r"「([^」]+)」", text))
+    literals.extend(re.findall(r'"([^"\n]+)"', text))
+    literals.extend(re.findall(r"'([^'\n]+)'", text))
+    literals.extend(re.findall(r"https?://[^\s]+", text))
+
+    # 去重并过滤空字符串，保持原始顺序，方便日志排查。
+    deduped: List[str] = []
+    for item in literals:
+        cleaned = item.strip()
+        if cleaned and cleaned not in deduped:
+            deduped.append(cleaned)
+    return deduped
+
+
+def action_matches_pending_task(action: Dict[str, Any], pending_task_description: str) -> bool:
+    """判断业务 action 是否明显还在处理上一个待结算任务。"""
+    literals = extract_task_literals(pending_task_description)
+    if not literals:
+        return False
+    payload = json.dumps(action, ensure_ascii=False)
+    return any(literal in payload for literal in literals)
+
+
+
+
+def enforce_pending_status_settlement(
+    actions: List[Dict[str, Any]],
+    pending_task_id: Any,
+    pending_task_description: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """处理“上一步做了业务动作但没标状态”的补偿边界。
+
+    场景：模型在 step 1 点击了按钮，但忘记 mark_task_complete。系统会记录
+    pending_task_id。若 step 2 同时出现“补标 step 1 完成”和“开始 step 2 的业务动作”，
+    这里会只保留补标动作，强制下一轮再开始 step 2。
+
+    例外：如果业务动作仍包含当前 pending 任务的 URL/关键词，则认为它仍属于当前任务，
+    不做截断。
+    """
+    if not pending_task_id or not isinstance(actions, list):
+        return actions
+
+    # 检查本轮动作里是否有标记 pending_task_id 完成的动作。
+    marked_pending = any(str(get_task_status_action_task_id(a)) == str(pending_task_id) for a in actions)
+    real_actions = [a for a in actions if has_real_business_action(a)]
+    if not marked_pending or not real_actions:
+        return actions
+    # 如果有标记 pending_task_id 的动作，同时又有真实业务动作，则可能出现了“忘记上一步 mark_task_complete”的情况。
+    # 这时如果业务动作里明显还在处理 pending_task_id 对应的任务（例如包含 pending_task_description 里的 URL/关键词），则认为它仍属于当前任务，不强行截断。
+    if pending_task_description and any(action_matches_pending_task(a, pending_task_description) for a in real_actions):
+        return actions
+    
+    # 否则强制只保留标记 pending_task_id 的动作，丢弃其他业务动作，等待下一轮模型输出真正的后续动作。
+    return [a for a in actions if str(get_task_status_action_task_id(a)) == str(pending_task_id)]
+
+
+
+def contains_auth_failture_signal(text: str) -> bool:
+    """检测登录/认证失败信号。
+
+    真实浏览器自动化中，登录失败可能出现在页面文本、模型观察摘要或 action 日志中。
+    这里用中英文关键字模拟检测逻辑，连续失败后由 BrowserAgent 标记任务失败。
+    """
+    if not text:
+        return False
+    normalized = text.lower()
+    keywords = [
+        "登录失败", "login failed", "invalid credentials", "incorrect password",
+        "用户名或密码", "账号或密码", "authentication failed", "auth failed",
+        "bad credentials", "unauthorized", "401", "403",
+    ]
+    return any(keyword in normalized for keyword in keywords)
+
+
+def clean_task_urls(text: str) -> str:
+    """清理 URL 结尾中文标点导致的解析歧义。
+
+    例如“访问 http://localhost:3000，然后登录”中，逗号紧贴 URL 时，部分解析器会把
+    中文逗号也视为 URL 的一部分。这里在 URL 和中文标点之间插入空格。
+    """
+    return re.sub(r"(https?://[^\s\u4e00-\u9fa5]+?)(?=[，；。、！])", r"\1 ", text)
                     
 
 

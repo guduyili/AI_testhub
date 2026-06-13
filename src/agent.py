@@ -156,6 +156,7 @@ class BrowserAgent:
             enable_gif: bool = False,
             case_name: str = "default_case",
             config_store: Optional[InMemoryConfigStore] = None,
+            action_plan: Optional[List[List[Dict[str, Any]]]] = None,
             use_real_llm: bool = False,
     ):
         self.execution_mode = execution_mode
@@ -174,7 +175,19 @@ class BrowserAgent:
         self.browser_profile = create_browser_profile()
 
         # action_plan 模拟 brower-use/LLM 每一步输出的动作列表，便于测试和演示；真实系统则由 LLM 实时生成。
-        self.action_plan = [] or action_plan
+        self.action_plan = [] or action_plan or []
+
+        # pending_status_* 用来记录“上一步有业务动作但模型忘记标状态”的任务，下一步补偿。
+        self.pending_status_task_id: Optional[int] = None
+        self.pending_status_action: Optional[Dict[str, Any]] = None
+
+        #  认证失败计数，同一任务连续失败达到阈值后，立即标记失败并停止
+        self.auth_failure_task_id: Optional[int] = None
+        self.auth_failure_count = 0
+
+        # 6.注册自定义浏览器动作
+        self.registered_actions = self.registered_actions()
+
 
 
     def _load_model_config(self) -> Optional[AIModelConfig]:
@@ -189,7 +202,17 @@ class BrowserAgent:
         return AIModelConfig(name="offline-fake")
 
     def verify_execution_result():
-        return 
+        """执行前检查 LLM 是否可用。
+
+        这对应“模型连通性预检查”。如果模型不可用，应在真正启动浏览器流程前失败，
+        避免用户等待很久才发现 API Key、网络或服务地址有问题。
+        """
+        try:
+            result = self.llm.invoke("Reply with OK") if hasattr(self.llm, "invoke") else "OK"
+            if result != "OK":
+                raise RuntimeError("empty response")
+        except Exception as e:
+            raise RuntimeError(f"LLM connectivity check failed: {e}") from e
 
     def create_browser_profile():
         """创建 browser-use 浏览器配置。
@@ -200,5 +223,98 @@ class BrowserAgent:
         return create_browser_profile(system="Linux", chrome_path=None)
 
 
+    def register_actions(self) -> Dict[str, Callable[..., Dict[str, Any]]]:
+        """注册自定义动作。
+
+        真实 browser-use Controller 会把这些函数注册给 Agent，LLM 可以在动作列表中调用
+        mark_task_complete / mark_task_failed 等动作。学习版只返回函数映射，便于理解每个
+        自定义动作的输入输出格式。
+        """
+
+        def mark(task_id: int, status: str) -> Dict[str, Any]:
+            """标记任务状态的通用函数，适用于 mark_task_complete / mark_task_failed / mark_task_skipped 等动作。"""
+            return {"task_id": task_id, "status": status}
 
 
+        return {
+            # Done 表示整个浏览器任务结束。
+            "Done": lambda success=True, text="": {"done": bool(success), "text": str(text)},
+            # close_tab 用于复刻"新标签页打开后关闭/切换"的动作能力
+            "close_tab": lambda: {"closed": True},
+            # 显示任务状态动作，前端抓鬼太同步依赖这些动作
+            "mark_task_complete": lambda task_id: mark(task_id, "completed"),
+            "mark_task_failed": lambda task_id: mark(task_id, "failed"),
+            "mark_task_skipped": lambda task_id: mark(task_id, "skipped"),
+            "update_task_status": lambda task_id, status: mark(task_id, str(status).lower()),
+        }
+
+    def analyze_task(self, task_description:str) -> List[Dict[str, Any]]:
+        """拆解自然语言任务，返回 planned_tasks。"""
+        return self.task_analyzer.analyze_task(task_description)
+    
+    def build_execution_prompt(self, task_description:str, planned_tasks:List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """构造强化后的执行提示词。
+
+        提示词的目的不是让模型“更会聊天”，而是明确自动化执行约束：
+        - 必须按 planned_tasks 顺序执行；
+        - 每个子任务完成/失败/跳过后必须立即调用状态动作；
+        - 标记任务 N 后不能在同一步开始任务 N+1；
+        - 不得编造登录凭据；
+        - 新标签页打开后要切换到最新标签页；
+        - 使用 browser-use 原生字段 index/text/tab_id。
+        """
+        # 先清理URL，避免中文标点粘在 URL 后导致浏览器访问错误地址
+        prompt = clean_task_urls(task_description)
+        if planned_tasks:
+            prompt += "\n\n重要指令: \n"
+            prompt += "你有一个子任务列表，必须严格按顺序执行.\n"
+            prompt += (
+                "每当你完成一个子任务，就必须立即调用对应的状态动作：\n"
+                "- mark_task_complete(task_id)\n"
+                "- mark_task_failed(task_id)\n"
+                "- mark_task_skipped(task_id)\n"
+                "如果你标记了某个子任务完成/失败/跳过，你不能在同一步开始下一个子任务了，必须等到下一步。\n"
+            )
+            prompt += "子任务: \n"
+            prompt += "\n".join(f"{task['id']}, {task['description']}" for task in planned_tasks)
+        
+        prompt += "\n\n关键性能与同步规则: \n"
+        prompt += "1. 仅在当前任务完成后标记该任务.\n"
+        prompt += "2. 如果你标记了任务 N, 则停止当前步骤: 不要开始任务 N+1.\n"
+        prompt += "3. 不要编造登录凭据，多次认证失败后停止"
+        prompt += "4. 如果链接打开了新标签页, 切换到最新的标签页"
+        prompt += "5. 使用原生动作参数： index/text/tab_id，不要使用 element_id/content/tab 等别名\n"
+        return 
+    
+
+    def _emit(self, callback: Optional[Callable[[Dict[str, Any]], None]], payload: Dict[str, Any]) -> None:
+        """向外部回调发送事件。
+
+        真实项目可能通过 SSE/WebSocket 推送；学习版用 callback 模拟。
+        """
+        if callback:
+            callback(payload)
+
+    def _default_action_plan(self, planned_tasks: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """没有传入 action_plan 时的离线默认动作计划。
+
+        它不会控制真实浏览器，只会逐个标记任务完成，确保示例可以跑通完整状态流。
+        """
+        return [[{"mark_task_complete": {"task_id": task["id"]}}] for task in planned_tasks]
+        
+        
+
+
+    def _handle_status_action(self, action: Dict[str, Any], planned_tasks: List[Dict[str, Any]], callback) -> bool:
+        """处理任务状态动作，并同步 planned_tasks 与外部回调。
+
+        Returns:
+            bool: True 表示 action 是状态动作；False 表示它是普通业务动作。
+        """
+
+        for name, params in action.items():
+            if name == "mark_task_complete":
+                task_id = params.get("task_id")
+                # 当前任务完成时，尝试安全补标前一个强依赖 pending 任务
+                backfill_prior_pending_tasks(planned_tasks, task_id)
+                
