@@ -107,3 +107,39 @@ def mark_first_active_task(planned_tasks: List[Dict[str, Any]], task_status: str
 def summarize_planned_tasks(planned_tasks: List[Dict[str, Any]]) -> Dict[str, int]:
     """统计不同状态的任务数量，返回状态分布摘要。"""
     summary = {"total": 0, "completed": 0, "failed": 0, "skipped": 0, "pending": 0, "in_progress": 0}
+#     if not planned_tasks:
+#         return summary
+#     summary["total"] = len(planned_tasks)
+#     for task in planned_tasks:
+#         status = task.get("status", "pending")
+#         if status in summary:
+#             summary[status] += 1
+#         else:
+#             # 未知状态按 pending 处理，避免误判整体通过。
+#             summary["pending"] += 1
+#     return summary
+
+
+# def resolve_execution_status(planned_tasks: List[Dict[str, Any]]) -> str:
+#     """根据所有子任务状态解析整体执行结果。"""
+#     summary = summarize_planned_tasks(planned_tasks)
+#     if summary["total"] == 0:
+#         return "passed"
+#     # 只要存在 failed/pending/in_progress，就不能算通过。
+#     if summary["failed"] > 0 or summary["pending"] > 0 or summary["in_progress"] > 0:
+#         return "failed"
+#     return "passed"
+
+
+# def is_infrastructure_failure(error_message: str) -> bool:
+#     """判断错误是否属于基础设施失败，而非业务步骤失败。
+
+#     基础设施失败包括 LLM 不可用、网络超时、API Key 错误、限流等。真实项目中这类错误
+#     通常不应直接归因到某个测试步骤，否则会误导用户以为业务页面有问题。
+#     """
+#     message = (error_message or "").lower()
+#     markers = [
+#         "execution llm unavailable", "connection error", "timed out", "timeout",
+#         "api key", "authentication", "unauthorized", "forbidden", "rate limit", "service unavailable",
+#     ]
+#     return any(marker in message for marker in markers)
