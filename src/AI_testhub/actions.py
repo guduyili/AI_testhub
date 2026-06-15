@@ -49,7 +49,7 @@ def normalize_action_params(action_name: str, action_params: Any) -> Any:
     # 非 dict 参数没有 key 可归一化，直接返回。
     if not isinstance(action_params, dict):
         return action_params
-    
+    # breakpoint()
     normalized: Dict[str, Any] = {}
     for key, value in action_params.items():
         normalized_key = key
@@ -63,6 +63,8 @@ def normalize_action_params(action_name: str, action_params: Any) -> Any:
         # 输入文本字段统一成 text。
         elif key in {"content", "value"} and action_name in {"input_text", "type"}:
             normalized_key = "text"
+        normalized[normalized_key] = value
+        # breakpoint()
     return normalized
 
 def normalize_action(action: Dict[str, Any]) -> Dict[str, Any]:
@@ -204,7 +206,7 @@ def enforce_pending_status_settlement(
 
 
 
-def contains_auth_failture_signal(text: str) -> bool:
+def contains_auth_failure_signal(text: str) -> bool:
     """检测登录/认证失败信号。
 
     真实浏览器自动化中，登录失败可能出现在页面文本、模型观察摘要或 action 日志中。
@@ -212,7 +214,7 @@ def contains_auth_failture_signal(text: str) -> bool:
     """
     if not text:
         return False
-    normalized = text.lower()
+    normalized = str(text).lower()
     keywords = [
         "登录失败", "login failed", "invalid credentials", "incorrect password",
         "用户名或密码", "账号或密码", "authentication failed", "auth failed",

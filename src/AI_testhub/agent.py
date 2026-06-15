@@ -179,14 +179,14 @@ class BrowserAgent:
 
         # pending_status_* 用来记录“上一步有业务动作但模型忘记标状态”的任务，下一步补偿。
         self.pending_status_task_id: Optional[int] = None
-        self.pending_status_action: Optional[Dict[str, Any]] = None
+        self.pending_status_task_description: Optional[str] = None
 
         #  认证失败计数，同一任务连续失败达到阈值后，立即标记失败并停止
         self.auth_failure_task_id: Optional[int] = None
         self.auth_failure_count = 0
 
         # 6.注册自定义浏览器动作
-        self.registered_actions = self.registered_actions()
+        self.registered_actions = self.register_actions()
 
 
 
@@ -197,11 +197,11 @@ class BrowserAgent:
         回退 fake 模型，让示例和测试可以无密钥运行。
         """
         config = self.config_store.get_active(role="browser_use_text")
-        if config is None:
+        if config:
             return config
-        return AIModelConfig(name="offline-fake")
+        return AIModelConfig(name="offline-fake", model_type="fake", model_name="fake-model", api_key="fake")
 
-    def verify_execution_result():
+    def verify_execution_result(self) -> None:
         """执行前检查 LLM 是否可用。
 
         这对应“模型连通性预检查”。如果模型不可用，应在真正启动浏览器流程前失败，
@@ -284,7 +284,7 @@ class BrowserAgent:
         prompt += "3. 不要编造登录凭据，多次认证失败后停止"
         prompt += "4. 如果链接打开了新标签页, 切换到最新的标签页"
         prompt += "5. 使用原生动作参数： index/text/tab_id，不要使用 element_id/content/tab 等别名\n"
-        return 
+        return prompt
     
 
     def _emit(self, callback: Optional[Callable[[Dict[str, Any]], None]], payload: Dict[str, Any]) -> None:
@@ -317,4 +317,187 @@ class BrowserAgent:
                 task_id = params.get("task_id")
                 # 当前任务完成时，尝试安全补标前一个强依赖 pending 任务
                 backfill_prior_pending_tasks(planned_tasks, task_id)
+                update_planned_task_status(planned_tasks, task_id, "completed")
+                self._emit(callback, {"task_id": int(task_id), "status": "completed"})
+                return True
+            
+            if name == "mark_task_failed":
+                task_id = params.get("task_id")
+                update_planned_task_status(planned_tasks, task_id, "failed")
+                self._emit(callback, {"task_id": int(task_id), "status": "failed"})
+                return True
+
+            if name == "mark_task_skipped": 
+                task_id = params.get("task_id")
+                update_planned_task_status(planned_tasks, task_id, "skipped")
+                self._emit(callback, {"task_id": int(task_id), "status": "skipped"})
+                return True
+
+            if name == "update_task_status":
+                task_id = params.get("task_id")
+                status = str(params.get("status", "")).lower()
+                update_planned_task_status(planned_tasks, task_id, status)
+                self._emit(callback, {"task_id": int(task_id), "status": status})
+                return True
+            return False
+
+    def run_task(
+            self,
+            task_description: str,
+            callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+            planned_tasks: Optional[List[Dict[str, Any]]] = None,
+            should_step: Optional[Callable[[], bool]] = None,
+            ) -> ExecutionHistory:
+        """执行已拆解的任务计划。
+
+        Args:
+            task_description: 原始自然语言任务，用于构造提示词和 URL 清理。
+            callback: 每步日志/状态变化的回调。
+            planned_tasks: 已拆解任务列表；不传则视为空计划。
+            should_stop: 停止信号函数；返回 True 时中断执行。
+
+        Returns:
+            ExecutionHistory: 包含最终状态、任务状态、日志和步骤动作。
+        """
+        # breakpoint()
+        # 先做一些执行前检查，确保模型可用，避免用户等待很久才发现问题。
+        self.verify_execution_result()
+
+        planned_tasks = planned_tasks or []
+
+        # 构造执行提示词；真实系统会在每一步循环里根据最新状态动态构造，这里简化为一次性构造。
+        self.build_execution_prompt(task_description, planned_tasks)
+
+        # 如果外部没有提供模拟动作计划，就使用默认“逐个完成”的离线动作计划。
+        plan = self.action_plan or self._default_action_plan(planned_tasks)
+        history = ExecutionHistory(status="running", planned_tasks=planned_tasks)
+
+        try:
+            for step_index,raw_actions in enumerate(plan, start=1):
+                # 支持用户 / 前端主动停止任务
+                if should_step and  should_step():
+                    history.status  = "stopped"
+                    history.logs.append("[System] user requested stop")
+                    break
+
+            # 1) 归一化参数：element_id -> index、content -> text、int -> task_id/index。
+            actions = [normalize_action(action) for action in raw_actions]
+
+            # 2) 如果上一步有业务动作但没标状态，这一步只允许先结算 pending 任务。
+            actions = enforce_pending_status_settlement(
+                actions,
+                self.pending_status_task_id,
+                self.pending_status_task_description,
+            )
+
+            # 3) 单任务边界：标记终态后，截断后续业务动作.
+            actions = enforce_single_task_step(actions)
+
+            # 记录步骤日志，方便复盘模型到底输出了什么动作
+            history.steps.append({"step": step_index, "actions": actions})
+            log_line = f"[Step {step_index}] Actions: {actions}"
+            history.logs.append(log_line)
+            self._emit(callback, {"type": "log", "content": log_line})
+
+            has_status = False
+            has_business = False
+            for action in actions:
+                # 状态动作会更新 planned_tasks；非状态动作视为业务动作。
+                if self._handle_status_action(action, planned_tasks, callback):
+                   has_status = True
+                else:
+                    has_business = True
+
+
+                # breakpoint()
+                # 登录失败检测：如果动作/观察文本中连续出现认证失败信号，则停止当前任务。
+                if contains_auth_failure_signal(str(action)):
+                    active = next((t for t in planned_tasks if t.get("status") in {"pending","in_progress"}), None)
+                    if active:
+                        if self.auth_failure_task_id == active["id"]:
+                            self.auth_failure_count += 1
+                        else:
+                            self.auth_failure_task_id = active["id"]
+                            self.auth_failure_count = 1
+                    if self.auth_failure_count >= 3:
+                        update_planned_task_status(planned_tasks, active["id"], "failed")
+                        history.logs.append(f"[System] repeated auth failure; task {active['id']} failed")
+                        history.status = "failed"
+                        return history
+                    
+            # 如果这一轮有真实业务动作但没有任何状态动作，说明模型忘记显式标记任务状态。
+            # 记录 pending，下一轮优先要求它补标，避免任务状态长期停留 pending。
+            if has_business and not has_status:
+                active = next((t for t in planned_tasks if t.get("status") in {"pending", "in_progress"}), None)
+                if active:
+                    self.pending_status_task_id = active["id"]
+                    self.pending_status_task_description = active.get("description")
+
+            # 所有步骤执行完后，根据 planned_tasks 汇总整体结果。
+            if history.status == "running":
+                history.status = resolve_execution_status(planned_tasks)
+            
+            return history
+            
+        except Exception as exc:
+            # 基础设施失败（LLM/API/网络）不强行归因到业务子任务；业务异常则标记当前任务失败。
+            if not is_infrastructure_failure(str(exc)):
+                mark_first_active_task(planned_tasks, "failed")
+            history.status = "failed"
+            history.logs.append(f"error: {exc}")
+            return history
+        
                 
+    def run_full_process(
+        self,
+        task_description: str,
+        analysis_callback: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+        step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> ExecutionHistory:
+        """执行完整链路：任务拆解 -> 回调同步 -> 执行任务。"""
+        planned_tasks = self.analyze_task(task_description)
+        if analysis_callback:
+            analysis_callback(planned_tasks)
+        # breakpoint()               
+        return self.run_task(task_description, step_callback,planned_tasks, should_stop)
+
+
+
+
+def get_agent_class(execution_mode: str) -> Any:
+    """根据执行模式返回 Agent 类。
+
+    真实项目可能根据 text/vision 等模式选择不同 Agent；学习版统一返回 BrowserAgent。
+    """
+    return BrowserAgent
+
+def run_ai_task_sync(
+    task_description: str,
+    planned_tasks: Optional[List[Dict[str, Any]]] = None,
+    callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    execution_mode: str = "text",
+    **kwargs,
+) -> ExecutionHistory:
+    """同步执行入口：创建 Agent 并执行已拆解任务。"""
+    agent = BrowserAgent(execution_mode=execution_mode, **kwargs)
+    return agent.run_task(task_description, callback, planned_tasks, should_stop)
+
+def analyze_task_sync(task_description: str, execution_mode: str = "text", **kwargs) -> List[Dict[str, Any]]:
+    """同步任务拆解入口：创建 Agent 并返回 planned_tasks。"""
+    agent = BrowserAgent(execution_mode="text", **kwargs)
+    return agent.analyze_task(task_description)
+
+
+
+def run_full_process_sync(
+    task_description: str,
+    analysis_callback: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    execution_mode: str = "text",
+    **kwargs,
+) -> ExecutionHistory:
+    agent = BrowserAgent(execution_mode="text", **kwargs)
+    return agent.run_full_process(task_description, analysis_callback, step_callback, should_stop)

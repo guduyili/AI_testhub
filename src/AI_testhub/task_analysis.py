@@ -72,12 +72,12 @@ class  TaskAnalyzer:
             # 如果整段文本只有一个编号匹配，但原始文本没有换行，可能是“1. 打开首页 2. 输入账号 3. 点击登录”这种
             # 内联编号。此时先按“编号前空格”重新切行，再递归解析。
             # 只有一个元素且无换行
-            if len(extracted) == 1 and "\n" not in text:
+            if len(extracted) == 1 and "\n" not in normalized:
                 split_inline = re.sub(r"\s+(?=\d+(?:\.\d+)*[\.\s、:：-]+)", "\n", normalized)
-                inline_steps = self.extract_structured_steps(split_inline)
-                if len(inline_steps) > 1:
-                    return inline_steps
-                
+                if split_inline != normalized:
+                    inline_steps = self.extract_structured_steps(split_inline)
+                    if len(inline_steps) > 1:
+                        return inline_steps
             return extracted
         
         # 没有按行解析到编号时，再尝试内联编号切分。

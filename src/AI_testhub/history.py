@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 
+
 @dataclass
 class ExecutionHistory:
     """一次浏览器智能任务执行的结果快照。
@@ -20,6 +21,7 @@ class ExecutionHistory:
         logs: 人类可读日志，模拟真实项目中的执行日志。
         steps: 每一步实际执行/模拟执行的 action 列表，用于调试动作流。
     """
+
 
     status: str
     planned_tasks: List[Dict[str, Any]] = field(default_factory=list)
