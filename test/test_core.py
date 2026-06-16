@@ -20,7 +20,7 @@ from AI_testhub.config import AIModelConfig, InMemoryConfigStore
 
 def test_normalize_action_params_converts_common_llm_aliases():
     assert normalize_action_params("click", {"element_id": 5}) == {"index": 5}
-    
+
     assert normalize_action_params("input_text", {"content": "hello"}) == {"text": "hello"}
     assert normalize_action_params("switch_tab", "abc") == {"tab_id": "abc"}
     assert normalize_action_params("mark_task_complete", 2) == {"task_id": 2}

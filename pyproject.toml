@@ -10,6 +10,7 @@ real = [
   "langchain-openai",
   "browser-use",
   "python-dotenv",
+  "socksio",
 ]
 test = ["pytest"]
 

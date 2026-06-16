@@ -1,6 +1,11 @@
 from __future__ import annotations
-"""
-    BrowserAgent 主流程
+
+"""BrowserAgent 主流程。
+
+这是从 TestHub 的 ai_base / ai_agent 中抽取出来的学习版核心文件。它不直接依赖
+Django、真实数据库、真实 browser-use 浏览器实例，因此可以在离线环境中运行测试。
+
+本文件重点复刻 10 条主链路能力：
 
 1. 加载 AI 模型配置：_load_model_config；
 2. 初始化 LangChain ChatOpenAI：build_chat_openai；
@@ -11,13 +16,17 @@ from __future__ import annotations
 7. 强化执行提示词：build_execution_prompt；
 8. 控制任务状态同步：_handle_status_action / run_task；
 9. 捕获认证失败、未标记任务、基础设施失败等异常场景；
-10. 执行完整流程：run_full_process / run_full_process_sync。  
+10. 执行完整流程：run_full_process / run_full_process_sync。
+
+真实项目中的 browser-use Agent 会实际控制浏览器。本学习版用 action_plan 模拟模型每
+一步输出的动作，使参数归一化、任务边界、状态同步等逻辑可以被单元测试覆盖。
 """
 
-
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from .actions_parser import repair_action_output
 from .actions import (
     clean_task_urls,
     contains_auth_failure_signal,
@@ -27,6 +36,7 @@ from .actions import (
 )
 from .browser_profile import BrowserProfileConfig, create_browser_profile
 from .config import AIModelConfig, InMemoryConfigStore
+from .events import EventBus, EventType
 from .history import ExecutionHistory
 from .state import (
     backfill_prior_pending_tasks,
@@ -59,38 +69,79 @@ class FakeChatOpenAI:
 
         return "OK"
     
-def build_chat_openai(config: AIModelConfig, use_real: bool= False) -> Any:
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    """解析布尔环境变量，兼容常见真值写法。"""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _build_structured_output_flags() -> Dict[str, bool]:
+    """构造 browser-use ChatOpenAI 的结构化输出兼容开关。
+
+    真实 OpenAI 端点支持 `response_format={'type': 'json_schema'}`；但很多 OpenAI-compatible
+    代理（例如 OpenCode Zen / DeepSeek 代理）只支持普通 completion，不支持该格式。
+    默认开启兼容模式：把 JSON schema 写进 system prompt，模型返回纯文本后再解析校验。
+    如果你用的是官方 OpenAI 且想使用原生结构化输出，可设置
+    `BROWSER_USE_STRICT_STRUCTURED_OUTPUT=1`。
+    """
+    strict = _parse_bool_env("BROWSER_USE_STRICT_STRUCTURED_OUTPUT", default=False)
+    if strict:
+        return {
+            "dont_force_structured_output": False,
+            "add_schema_to_system_prompt": False,
+            "remove_min_items_from_schema": False,
+        }
+    return {
+        "dont_force_structured_output": _parse_bool_env(
+            "BROWSER_USE_DONT_FORCE_STRUCTURED_OUTPUT", default=True
+        ),
+        "add_schema_to_system_prompt": _parse_bool_env(
+            "BROWSER_USE_ADD_SCHEMA_TO_SYSTEM_PROMPT", default=True
+        ),
+        "remove_min_items_from_schema": _parse_bool_env(
+            "BROWSER_USE_REMOVE_MIN_ITEMS_FROM_SCHEMA", default=True
+        ),
+    }
+
+
+def build_chat_openai(config: AIModelConfig, use_real: bool = False) -> Any:
     """根据配置创建真实或离线的 ChatOpenAI-like 对象。
 
     Args:
         config: AIModelConfig，包含模型名、API Key、base_url、temperature 等。
-        use_real: True 时尝试导入 langchain_openai.ChatOpenAI；False 时使用 FakeChatOpenAI。
+        use_real: True 时尝试导入 browser-use 原生的 ChatOpenAI；False 时使用 FakeChatOpenAI。
 
     Returns:
         Any: 真实 ChatOpenAI 或 FakeChatOpenAI。
 
     Raises:
-        RuntimeError: use_real=True 但未安装 langchain-openai 时抛出清晰错误。
+        RuntimeError: use_real=True 但未安装 browser-use 时抛出清晰错误。
     """
-
     if use_real:
         try:
-            from langchain_openai import ChatOpenAI
-        except ImportError as e:
-            raise RuntimeError(
-                "langchain-openai is not installed. Install with: uv sync --extra real") from exc
+            from browser_use.llm.openai.chat import ChatOpenAI
+        except ImportError as exc:
+            raise RuntimeError("browser-use is not installed. Install with: uv sync --extra real") from exc
 
-        # LangChain 的 ChatOpenAI 支持 OpenAI-compatible 接口；base_url 为空时传 None，
-        # 让 SDK 使用默认地址。
+        # browser-use 自带的 ChatOpenAI 封装了 OpenAI-compatible 调用，并且提供兼容开关：
+        # - dont_force_structured_output=True: 不强制 response_format=json_schema，模型以纯文本返回；
+        # - add_schema_to_system_prompt=True: 把 JSON schema 附加到 system prompt；
+        # - remove_min_items_from_schema=True: 移除 schema 中的 minItems，避免部分模型报错。
+        # 这些开关对 OpenCode Zen / DeepSeek 等代理至关重要，否则会得到
+        # "This response_format type is unavailable now" 或 "items" 类解析失败。
         llm = ChatOpenAI(
             model=config.model_name,
             api_key=config.api_key,
             base_url=config.base_url or None,
             temperature=config.temperature,
+            **compat_flags,
         )
 
         # 给真实 ChatOpenAI 补充 provider/model 字段，方便日志和测试读取。
-        # 某些 Pydantic 对象可能禁止动态赋值，因此失败时忽略，不影响模型调用。
+        # dataclass 可能禁止直接赋值，因此失败时忽略，不影响模型调用
         try:
             object.__setattr__(llm, "provider", config.model_type)
             object.__setattr__(llm, "model", config.model_name)
@@ -214,7 +265,7 @@ class BrowserAgent:
         except Exception as e:
             raise RuntimeError(f"LLM connectivity check failed: {e}") from e
 
-    def create_browser_profile():
+    def create_browser_profile() -> BrowserProfileConfig:
         """创建 browser-use 浏览器配置。
 
         学习版固定按 Linux/WSL 环境生成配置；真实项目可根据部署环境传入不同 system 和
@@ -286,14 +337,38 @@ class BrowserAgent:
         prompt += "5. 使用原生动作参数： index/text/tab_id，不要使用 element_id/content/tab 等别名\n"
         return prompt
     
-
     def _emit(self, callback: Optional[Callable[[Dict[str, Any]], None]], payload: Dict[str, Any]) -> None:
-        """向外部回调发送事件。
+        """向外部回调发送结构化事件。
 
-        真实项目可能通过 SSE/WebSocket 推送；学习版用 callback 模拟。
+        真实项目可能通过 SSE/WebSocket 推送；学习版用 EventBus 把内部 payload
+        统一转换为 JSON 友好的事件 dict，再交给 callback。
         """
-        if callback:
-            callback(payload)
+        if not callback:
+            return
+
+        bus = EventBus(callback)
+        if payload.get("type") == "log":
+            content = str(payload.get("content", ""))
+            bus.emit(EventType.STEP_LOG, message=content, data={"content": content})
+            return
+
+        task_id = payload.get("task_id")
+        status = str(payload.get("status", "")).lower()
+        status_event_types = {
+            "completed": EventType.TASK_COMPLETE,
+            "failed": EventType.TASK_FAILED,
+            "skipped": EventType.TASK_SKIPPED,
+        }
+        if task_id is not None and status in status_event_types:
+            bus.emit(
+                status_event_types[status],
+                task_id=int(task_id),
+                message=f"task {task_id} {status}",
+                data={"status": status},
+            )
+            return
+
+        callback(payload)
 
     def _default_action_plan(self, planned_tasks: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         """没有传入 action_plan 时的离线默认动作计划。
@@ -378,20 +453,25 @@ class BrowserAgent:
                 if should_step and  should_step():
                     history.status  = "stopped"
                     history.logs.append("[System] user requested stop")
+                    EventBus(callback).emit(EventType.PROCESS_STOPPED, message="user requested stop", data={"status": "stopped"})
                     break
 
-            # 1) 归一化参数：element_id -> index、content -> text、int -> task_id/index。
-            actions = [normalize_action(action) for action in raw_actions]
+            # 1) 修复 LLM/browser-use 常见混合输出形态：字符串函数调用、顶层状态字段、非法字符串参数。
+            repaired_actions = repair_action_output(raw_actions)
 
-            # 2) 如果上一步有业务动作但没标状态，这一步只允许先结算 pending 任务。
+            # 2) 归一化参数：element_id -> index、content -> text、int -> task_id/index。
+            actions = [normalize_action(action) for action in repaired_actions]
+
+            # 3) 如果上一步有业务动作但没标状态，这一步只允许先结算 pending 任务。
             actions = enforce_pending_status_settlement(
                 actions,
                 self.pending_status_task_id,
                 self.pending_status_task_description,
             )
 
-            # 3) 单任务边界：标记终态后，截断后续业务动作.
+            # 3) 单任务边界：标记终态后，截断后续业务动作。
             actions = enforce_single_task_step(actions)
+
 
             # 记录步骤日志，方便复盘模型到底输出了什么动作
             history.steps.append({"step": step_index, "actions": actions})
@@ -423,6 +503,11 @@ class BrowserAgent:
                         update_planned_task_status(planned_tasks, active["id"], "failed")
                         history.logs.append(f"[System] repeated auth failure; task {active['id']} failed")
                         history.status = "failed"
+                        EventBus(callback).emit(
+                            EventType.PROCESS_FAILED,
+                            message="repeated auth failure",
+                            data={"status": "failed", "task_id": active["id"]},
+                        )
                         return history
                     
             # 如果这一轮有真实业务动作但没有任何状态动作，说明模型忘记显式标记任务状态。
@@ -437,14 +522,20 @@ class BrowserAgent:
             if history.status == "running":
                 history.status = resolve_execution_status(planned_tasks)
             
+            if history.status == "passed":
+                EventBus(callback).emit(EventType.PROCESS_COMPLETE, message="process complete", data={"status": history.status})
+            elif history.status == "failed":
+                EventBus(callback).emit(EventType.PROCESS_FAILED, message="process failed", data={"status": history.status})
+            elif history.status == "stopped":
+                EventBus(callback).emit(EventType.PROCESS_STOPPED, message="user requested stop", data={"status": history.status})
             return history
-            
         except Exception as exc:
             # 基础设施失败（LLM/API/网络）不强行归因到业务子任务；业务异常则标记当前任务失败。
             if not is_infrastructure_failure(str(exc)):
                 mark_first_active_task(planned_tasks, "failed")
             history.status = "failed"
             history.logs.append(f"error: {exc}")
+            EventBus(callback).emit(EventType.PROCESS_FAILED, message="process failed", data={"status": "failed", "error": str(exc)})
             return history
         
                 
@@ -459,6 +550,12 @@ class BrowserAgent:
         planned_tasks = self.analyze_task(task_description)
         if analysis_callback:
             analysis_callback(planned_tasks)
+        elif step_callback:
+            EventBus(step_callback).emit(
+                EventType.TASK_ANALYSIS,
+                message="task analysis complete",
+                data={"tasks": planned_tasks},
+            )
         # breakpoint()               
         return self.run_task(task_description, step_callback,planned_tasks, should_stop)
 
