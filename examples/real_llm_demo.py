@@ -1,40 +1,44 @@
-import os
+from __future__ import annotations
 
-from AI_testhub.real_config import load_real_model_config, parse_bool_env
+"""真实 LLM 连通性检查示例。
+
+默认只构造 ChatOpenAI，不发起网络请求：
+
+    PYTHONPATH=src uv run --extra real python examples/real_llm_demo.py
+
+确认环境变量后，如需真的调用模型：
+
+    PYTHONPATH=src uv run --extra real python examples/real_llm_demo.py --run
+"""
+
+import argparse
+
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
+from AI_testhub.agent import build_chat_openai
+from AI_testhub.real_config import load_real_model_config
 
 
-def test_parse_bool_env_accepts_common_truthy_and_falsey_values(monkeypatch):
-    monkeypatch.setenv("BROWSER_HEADLESS", "false")
-    assert parse_bool_env("BROWSER_HEADLESS", default=True) is False
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Check real LangChain ChatOpenAI initialization.")
+    parser.add_argument("--run", action="store_true", help="Actually invoke the LLM. Without this flag only constructs the client.")
+    args = parser.parse_args()
 
-    monkeypatch.setenv("BROWSER_HEADLESS", "1")
-    assert parse_bool_env("BROWSER_HEADLESS", default=False) is True
-
-    monkeypatch.delenv("BROWSER_HEADLESS")
-    assert parse_bool_env("BROWSER_HEADLESS", default=True) is True
-
-
-def test_load_real_model_config_reads_openai_environment(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.example.test/v1")
-    monkeypatch.setenv("OPENAI_MODEL", "gpt-4o-mini")
-    monkeypatch.setenv("OPENAI_PROVIDER", "openai-compatible")
-
+    load_dotenv()
     config = load_real_model_config()
+    llm = build_chat_openai(config, use_real=True)
+    print(f"constructed: {llm.__class__.__name__}")
+    print(f"provider: {getattr(llm, 'provider', None)}")
+    print(f"model: {getattr(llm, 'model', None)}")
 
-    assert config.name == "real-env"
-    assert config.model_type == "openai-compatible"
-    assert config.model_name == "gpt-4o-mini"
-    assert config.api_key == "test-key"
-    assert config.base_url == "https://api.example.test/v1"
+    if not args.run:
+        print("network_call: skipped; pass --run to invoke the model")
+        return
+
+    result = llm.ainvoke("Reply with OK only.")
+    print(f"response: {getattr(result, 'content', result)}")
 
 
-def test_load_real_model_config_raises_clear_error_without_api_key(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    try:
-        load_real_model_config()
-    except RuntimeError as exc:
-        assert "OPENAI_API_KEY" in str(exc)
-    else:
-        raise AssertionError("expected missing OPENAI_API_KEY error")
+if __name__ == "__main__":
+    main()

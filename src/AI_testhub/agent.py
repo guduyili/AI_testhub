@@ -132,6 +132,7 @@ def build_chat_openai(config: AIModelConfig, use_real: bool = False) -> Any:
         # - remove_min_items_from_schema=True: 移除 schema 中的 minItems，避免部分模型报错。
         # 这些开关对 OpenCode Zen / DeepSeek 等代理至关重要，否则会得到
         # "This response_format type is unavailable now" 或 "items" 类解析失败。
+        compat_flags = _build_structured_output_flags()
         llm = ChatOpenAI(
             model=config.model_name,
             api_key=config.api_key,
